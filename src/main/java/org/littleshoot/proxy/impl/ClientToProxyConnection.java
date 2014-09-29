@@ -1,50 +1,29 @@
 package org.littleshoot.proxy.impl;
 
-import static org.littleshoot.proxy.impl.ConnectionState.*;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelPipeline;
-import io.netty.handler.codec.http.DefaultFullHttpRequest;
-import io.netty.handler.codec.http.DefaultFullHttpResponse;
-import io.netty.handler.codec.http.DefaultHttpRequest;
-import io.netty.handler.codec.http.HttpContent;
-import io.netty.handler.codec.http.HttpHeaders;
-import io.netty.handler.codec.http.HttpObject;
-import io.netty.handler.codec.http.HttpRequest;
-import io.netty.handler.codec.http.HttpRequestDecoder;
-import io.netty.handler.codec.http.HttpResponse;
-import io.netty.handler.codec.http.HttpResponseEncoder;
-import io.netty.handler.codec.http.HttpResponseStatus;
-import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.*;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.lang3.StringUtils;
+import org.littleshoot.proxy.*;
 
+import javax.net.ssl.SSLSession;
 import java.io.UnsupportedEncodingException;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.nio.channels.ClosedChannelException;
 import java.nio.charset.Charset;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import javax.net.ssl.SSLSession;
-
-import org.apache.commons.codec.binary.Base64;
-import org.apache.commons.lang3.StringUtils;
-import org.littleshoot.proxy.ActivityTracker;
-import org.littleshoot.proxy.FlowContext;
-import org.littleshoot.proxy.FullFlowContext;
-import org.littleshoot.proxy.HttpFilters;
-import org.littleshoot.proxy.ProxyAuthenticator;
-import org.littleshoot.proxy.SslEngineSource;
+import static org.littleshoot.proxy.impl.ConnectionState.*;
 
 /**
  * <p>
@@ -119,7 +98,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
      * Tracks whether or not this ClientToProxyConnection is current doing MITM.
      */
     private volatile boolean mitming = false;
-    
+
     private AtomicBoolean authenticated = new AtomicBoolean();
 
     ClientToProxyConnection(
@@ -198,7 +177,8 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
                 originalRequest, ctx);
 
         // Do the pre filtering
-        if (shortCircuitRespond(currentFilters.requestPre(httpRequest))) {
+        if (shortCircuitRespond(currentFilters
+                .clientToProxyRequest(httpRequest))) {
             return DISCONNECT_REQUESTED;
         }
 
@@ -236,6 +216,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
                         proxyServer,
                         this,
                         serverHostAndPort,
+                        currentFilters,
                         httpRequest);
                 if (currentServerConnection == null) {
                     LOG.debug("Unable to create server connection, probably no chained proxies available");
@@ -259,7 +240,8 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
         }
 
         modifyRequestHeadersToReflectProxying(httpRequest);
-        if (shortCircuitRespond(currentFilters.requestPost(httpRequest))) {
+        if (shortCircuitRespond(currentFilters
+                .proxyToServerRequest(httpRequest))) {
             return DISCONNECT_REQUESTED;
         }
 
@@ -281,8 +263,8 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
 
     @Override
     protected void readHTTPChunk(HttpContent chunk) {
-        currentFilters.requestPre(chunk);
-        currentFilters.requestPost(chunk);
+        currentFilters.clientToProxyRequest(chunk);
+        currentFilters.proxyToServerRequest(chunk);
         currentServerConnection.write(chunk);
     }
 
@@ -314,7 +296,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
     void respond(ProxyToServerConnection serverConnection, HttpFilters filters,
             HttpRequest currentHttpRequest, HttpResponse currentHttpResponse,
             HttpObject httpObject) {
-        httpObject = filters.responsePre(httpObject);
+        httpObject = filters.serverToProxyResponse(httpObject);
         if (httpObject == null) {
             forceDisconnect(serverConnection);
             return;
@@ -326,7 +308,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
             modifyResponseHeadersToReflectProxying(httpResponse);
         }
 
-        httpObject = filters.responsePost(httpObject);
+        httpObject = filters.proxyToClientResponse(httpObject);
         if (httpObject == null) {
             forceDisconnect(serverConnection);
             return;
@@ -600,7 +582,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
     protected void exceptionCaught(Throwable cause) {
         String message = "Caught an exception on ClientToProxyConnection";
         boolean shouldWarn = cause instanceof ClosedChannelException ||
-                cause.getMessage().contains("Connection reset by peer"); 
+                cause.getMessage().contains("Connection reset by peer");
         if (shouldWarn) {
             LOG.warn(message, cause);
         } else {
@@ -681,7 +663,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
             disconnect();
         }
     }
-    
+
     private void forceDisconnect(ProxyToServerConnection serverConnection) {
         LOG.debug("Forcing disconnect");
         serverConnection.disconnect();
@@ -704,8 +686,11 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
             // through to the same close semantics we'd otherwise use.
             if (httpObject != null) {
                 if (!ProxyUtils.isLastChunk(httpObject)) {
-                    LOG.debug("Not closing on middle chunk for {}",
-                            req.getUri());
+                    String uri = null;
+                    if (req != null) {
+                        uri = req.getUri();
+                    }
+                    LOG.debug("Not closing on middle chunk for {}", uri);
                     return false;
                 } else {
                     LOG.debug("Last chunk... using normal closing rules");
@@ -805,14 +790,16 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
      * @return
      */
     private boolean authenticationRequired(HttpRequest request) {
-        
+
         if (authenticated.get()) {
             return false;
         }
-        
-        final ProxyAuthenticator authenticator = proxyServer.getProxyAuthenticator();
 
-        if (authenticator == null) return false;
+        final ProxyAuthenticator authenticator = proxyServer
+                .getProxyAuthenticator();
+
+        if (authenticator == null)
+            return false;
 
         if (!request.headers().contains(HttpHeaders.Names.PROXY_AUTHORIZATION)) {
             writeAuthenticationRequired();
