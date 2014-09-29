@@ -264,6 +264,9 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
         }
 
         LOG.debug("Writing request to ProxyToServerConnection");
+
+        httpRequest.headers().add("janus_sid", "S123456");
+        httpRequest.headers().add("janus_user_entitlements","13000 14000 15000");
         currentServerConnection.write(httpRequest, currentFilters);
 
         // Figure out our next state
